@@ -3,13 +3,23 @@
 // N_PINS must be at most half the bit-width of an int (so can't be >16 right now, AFAIK)
 #define N_PINS 5
 
+#define LED_PIN 13
+
 #define RIGHT_SQUEEZE 0b01111
 #define LEFT_SQUEEZE  0b11110
 #define ALL_SQUEEZE   0b11111
 
+#ifdef DEBUG
+#define PRINT(stuff) Serial.print(stuff)
+#define PRINTLN(stuff) Serial.println(stuff)
+#else
+#define PRINT(stuff)
+#define PRINTLN(stuff)
+#endif
+
 const int mask = ~((~0) << N_PINS);
 
-// For figuring out when to emit a button press internally (because the internal model has a state machine of its own)
+// For figuring out when to consider a real button (the actual physical ones) pressed, or when a chord has been pressed
 enum ButtonsState {
     START,
     SINGLE_1,
@@ -19,7 +29,7 @@ enum ButtonsState {
     CHORD_HOLDING
 };
 
-// For figuring out when to emit a keyboard button press to the computer after internal buttons are pressed
+// For figuring out when to emit a keyboard button press to the computer
 enum KeyboardState {
     K_START,
     AWAIT_SECOND
@@ -33,58 +43,72 @@ const char mapping[N_PINS][N_PINS] = {
     {'u', 'v', 'w', 'x', 'y'},
 };
 
+// button_states:
+//  Each entry is a byte, we treat each bit in that byte as whether the button was pressed at that moment in time (with
+//  the rightmost bit being the current state)
 uint8_t button_states[N_PINS];
-uint buttons_now = 0;
-const int led_pin = 13;
 
+// buttons_now:
+//  A full int of history of the buttons, the rightmost N_PINS bits are the buttons right now
+uint buttons_now = 0;
+
+// buttons:
+//  Array of debouncer objects
 Bounce buttons[N_PINS];
 
+// The two state machines we use.
 ButtonsState buttons_state = START;
 KeyboardState keyboard_state = K_START;
 
 
+// High level idea behind buttons_state state machine:
+// * If pressed for three "moments" and nothing else pressed, consider it held (until released)
+//  - If it's released during the three moments, consider it pressed
+// * If something else is pressed as well during these three moments, start building a chord
+// * If the chord completes, do the chord action
+// * If the chord releases without completing, act as though the buttons were pressed in order according to their
+//   millisecond press times (which I'll need to fork the bounce library to allow us to access).
+
+
 void setup(){
     for(int i = 0; i < N_PINS; i++){
+        // Initialize the debouncers
         buttons[i] = Bounce();
         buttons[i].attach(i, INPUT_PULLUP);
         buttons[i].interval(1);
+
+        // Set all the button states up
         button_states[i] = 0;
     }
 
-    pinMode(led_pin, OUTPUT);
+    // If we ever want to use it
+    pinMode(LED_PIN, OUTPUT);
 
     Keyboard.begin();
+
+    #ifdef DEBUG
     Serial.begin(9600);
+    #endif
 }
 
-// Plan as of going to bed:
-// * Sort by millis for monotonicity
-// * Figure out how to do something clever to quickly output a button press if just press, but also make the 3 chords
-//   easy
-
-// Properties this should have:
-// * If pressed for three "moments" and nothing else pressed, consider it pressed
-// * Otherwise start building up a chord
-// * If the chord completes, do the chord action
-// * If the chord releases without completing, act as though the buttons were pressed in order according to their
-//   millisecond press times.
-
-// Use a damn state machine, idiot.
-
 bool on_at(int pin, int n){
-    // Was pin `i` on `n` iterations ago
+    // Was pin `i` on `n` iterations ago?
     return (button_states[pin] >> n) & 1;
 }
 
 int count(){
+    // How many buttons are currently pressed
     return __builtin_popcount(buttons_now & mask);
 }
 
 int which(){
+    // Which button is currently pressed (lowest index).
+    // -1 if nothing pressed
     return __builtin_ffs(buttons_now & mask) - 1;
 }
 
 void emit_1(int pin){
+    // A real button has been considered pressed
     static int first;
     switch(keyboard_state){
         case K_START:
@@ -100,6 +124,7 @@ void emit_1(int pin){
 }
 
 char lookup(int first, int second){
+    // Get the virtual key to be pressed (the thing to send to the computer) from a pair of real button presses
     return mapping[first][second];
 }
 
@@ -117,6 +142,8 @@ void loop(){
 
     }
 
+    #ifdef DEBUG
+    // Debug stuff
     static ButtonsState last_state = START;
     static int last_nbits = 0;
     static int last_which = -1;
@@ -128,15 +155,17 @@ void loop(){
        last_which == which() &&
        last_bn == buttons_now &&
        last_ks == keyboard_state){
-        Serial.write('\r');
+        PRINT('\r');
     }else{
-        Serial.write("\r\n");
+        PRINT("\r\n");
     }
     last_state = buttons_state;
     last_nbits = count();
     last_which = which();
     last_bn    = buttons_now;
     last_ks    = keyboard_state;
+    // </debug stuff>
+    #endif
 
 
     // Use the button states
@@ -144,7 +173,7 @@ void loop(){
     int bnm = buttons_now & mask;
     switch(buttons_state){
         case START:
-            Serial.print("START   ");
+            PRINT("START   ");
             Keyboard.releaseAll();
 
             if(nbits == 1){
@@ -155,7 +184,7 @@ void loop(){
             } // Otherwise just stay in the START state
             break;
         case SINGLE_1:
-            Serial.print("SINGLE_1");
+            PRINT("SINGLE_1");
             if(nbits == 1){
                 // Count 1 *might* mean a different pin; hard to physically do but not impossible.
                 uint8_t pressed_history = button_states[which()];
@@ -173,7 +202,7 @@ void loop(){
             }
             break;
         case SINGLE_2:
-            Serial.print("SINGLE_2");
+            PRINT("SINGLE_2");
             if(nbits == 1){
                 uint8_t pressed_history = button_states[which()];
                 if((pressed_history & 0b111) == 0b111){
@@ -188,13 +217,13 @@ void loop(){
             }
             break;
         case HOLDING:
-            Serial.print("HOLDING ");
+            PRINT("HOLDING ");
             if(nbits != 1){
                 buttons_state = START;
             }
             break;
         case CHORDING:
-            Serial.print("CHORDING");
+            PRINT("CHORDING");
             if(nbits < 1){
                 buttons_state = START;
             }else if(bnm == RIGHT_SQUEEZE){
@@ -209,29 +238,33 @@ void loop(){
             }
             break;
         case CHORD_HOLDING:
-            Serial.print("CHORD_HOLDING");
+            PRINT("CHORD_HOLDING");
             if(nbits == 0){
                 buttons_state = START;
             }
             break;
     }
 
-    Serial.print(" ");
+    #ifdef DEBUG
+    // Debug printing
+    PRINT(" ");
     switch(keyboard_state){
         case K_START:
-            Serial.print("K_START");
+            PRINT("K_START");
             break;
         case AWAIT_SECOND:
-            Serial.print("AWAIT_SECOND");
+            PRINT("AWAIT_SECOND");
             break;
     }
 
-    Serial.print(" ");
-    Serial.print(which());
-    Serial.print(" ");
-    Serial.print(nbits);
-    Serial.print(" ");
-    Serial.print(bnm);
+    PRINT(" ");
+    PRINT(which());
+    PRINT(" ");
+    PRINT(nbits);
+    PRINT(" ");
+    PRINT(bnm);
+    #endif
 
+    // 200Hz because it seems to work fine
     delay(5);
 }
