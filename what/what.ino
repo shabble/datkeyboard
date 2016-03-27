@@ -1,4 +1,4 @@
-#include <Bounce2.h>
+#include "KitBounce.h"
 
 // N_PINS must be at most half the bit-width of an int (so can't be >16 right now, AFAIK)
 #define N_PINS 5
