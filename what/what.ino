@@ -1,152 +1,237 @@
-/* Buttons to USB Keyboard Example
-
-   You must select Keyboard from the "Tools > USB Type" menu
-
-   This example code is in the public domain.
- */
-
 #include <Bounce2.h>
 
-// 10 = 10 ms debounce time which is appropriate for most mechanical pushbuttons
-#define BOUNCE_TIME 1
+// N_PINS must be at most half the bit-width of an int (so can't be >16 right now, AFAIK)
 #define N_PINS 5
 
-#define DEBUG(thing) if(debug){ Keyboard.print(thing); }
-#define DEBUGLN(thing) if(debug){ Keyboard.println(thing); }
+#define RIGHT_SQUEEZE 0b01111
+#define LEFT_SQUEEZE  0b11110
+#define ALL_SQUEEZE   0b11111
 
-char mapping[5][5] = {
-    {'z', 'b', 'c', 'd', 'e'},
+const int mask = ~((~0) << N_PINS);
+
+// For figuring out when to emit a button press internally (because the internal model has a state machine of its own)
+enum ButtonsState {
+    START,
+    SINGLE_1,
+    SINGLE_2,
+    HOLDING,
+    CHORDING,
+    CHORD_HOLDING
+};
+
+// For figuring out when to emit a keyboard button press to the computer after internal buttons are pressed
+enum KeyboardState {
+    K_START,
+    AWAIT_SECOND
+};
+
+const char mapping[N_PINS][N_PINS] = {
+    {'a', 'b', 'c', 'd', 'e'},
     {'f', 'g', 'h', 'i', 'j'},
     {'k', 'l', 'm', 'n', 'o'},
     {'p', 'q', 'r', 's', 't'},
     {'u', 'v', 'w', 'x', 'y'},
 };
 
-bool debug = true;
-bool backout_chord[5] = {true, true, true, true, true};
+uint8_t button_states[N_PINS];
+uint buttons_now = 0;
+const int led_pin = 13;
 
-enum State {
-    FIRST,
-    SECOND
-};
-
-State current_state = FIRST;
-bool pressed_run[N_PINS];
-bool released_run[N_PINS];
-int first_pressed, count = 0;
-
-void reset_run(){
-    for(int i = 0; i < N_PINS; i++){
-        pressed_run[i] = false;
-        released_run[i] = false;
-    }
-}
-
-bool run_finished(){
-    return array_equal(pressed_run, released_run);
-}
-
-bool array_equal(bool a[], bool b[]){
-    for(int i = 0; i < N_PINS; i++){
-        if(a[i] != b[i]){
-            return false;
-        }
-    }
-    return true;
-}
-
-int get_one_pressed(){
-    for(int i = 0; i < N_PINS; i++){
-        if(pressed_run[i]){
-            return i;
-        }
-    }
-    return -1;
-}
-
-// Create Bounce objects for each button.  The Bounce object
-// automatically deals with contact chatter or "bounce", and
-// it makes detecting changes very simple.
 Bounce buttons[N_PINS];
-void setup() {
-    // Configure the pins for input mode with pullup resistors.
-    // The pushbuttons connect from each pin to ground.  When
-    // the button is pressed, the pin reads LOW because the button
-    // shorts it to ground.  When released, the pin reads HIGH
-    // because the pullup resistor connects to +5 volts inside
-    // the chip.  LOW for "on", and HIGH for "off" may seem
-    // backwards, but using the on-chip pullup resistors is very
-    // convenient.  The scheme is called "active low", and it's
-    // very commonly used in electronics... so much that the chip
-    // has built-in pullup resistors!
+
+ButtonsState buttons_state = START;
+KeyboardState keyboard_state = K_START;
+
+
+void setup(){
     for(int i = 0; i < N_PINS; i++){
         buttons[i] = Bounce();
         buttons[i].attach(i, INPUT_PULLUP);
-        buttons[i].interval(BOUNCE_TIME);
+        buttons[i].interval(1);
+        button_states[i] = 0;
     }
+
+    pinMode(led_pin, OUTPUT);
+
     Keyboard.begin();
+    Serial.begin(9600);
 }
 
-void press(int pin){
-    switch(current_state){
-        case FIRST:
-            first_pressed = pin;
-            current_state = SECOND;
+// Plan as of going to bed:
+// * Sort by millis for monotonicity
+// * Figure out how to do something clever to quickly output a button press if just press, but also make the 3 chords
+//   easy
+
+// Properties this should have:
+// * If pressed for three "moments" and nothing else pressed, consider it pressed
+// * Otherwise start building up a chord
+// * If the chord completes, do the chord action
+// * If the chord releases without completing, act as though the buttons were pressed in order according to their
+//   millisecond press times.
+
+// Use a damn state machine, idiot.
+
+bool on_at(int pin, int n){
+    // Was pin `i` on `n` iterations ago
+    return (button_states[pin] >> n) & 1;
+}
+
+int count(){
+    return __builtin_popcount(buttons_now & mask);
+}
+
+int which(){
+    return __builtin_ffs(buttons_now & mask) - 1;
+}
+
+void emit_1(int pin){
+    static int first;
+    switch(keyboard_state){
+        case K_START:
+            first = which();
+            keyboard_state = AWAIT_SECOND;
             break;
-        case SECOND:
-            Keyboard.press(mapping[first_pressed][pin]);
-            current_state = FIRST;
+
+        case AWAIT_SECOND:
+            keyboard_state = K_START;
+            Keyboard.press(lookup(first, which()));
             break;
     }
-    Keyboard.releaseAll();
 }
 
-void loop() {
-    int pressed;
-    bool dirty = false;
-    DEBUG("Count: ");
-    DEBUGLN(count);
-    count++;
-    // Update things
-    for(int i = 0; i < N_PINS; i++){
+char lookup(int first, int second){
+    return mapping[first][second];
+}
+
+void loop(){
+    // Update button states
+    for(int i = N_PINS - 1; i >= 0; i--){ // Downwards because we're pushing backwards onto buttons_now
         buttons[i].update();
 
-        if (buttons[i].fell()) {
-            dirty = true;
-            pressed_run[i] = true;
-            DEBUG("Pressed ");
-            DEBUGLN(i);
-        }else if(buttons[i].rose()){
-            dirty = true;
-            DEBUG("Released ");
-            DEBUGLN(i);
-            released_run[i] = true;
-        }
+        // We use the button states as an 8-iteration-long history of the button
+        button_states[i] <<= 1;
+        button_states[i] |= !buttons[i].read(); // ! because pullup
+
+        buttons_now <<= 1;
+        buttons_now |= !buttons[i].read();
+
     }
 
-    // Check the state so we know when to do a thing
-    if(dirty && run_finished()){
-        // Check multi
-        if(array_equal(pressed_run, backout_chord)){
-            current_state = FIRST;
-        }else{
-            pressed = get_one_pressed();
-            if(pressed > -1){
-                press(pressed);
+    static ButtonsState last_state = START;
+    static int last_nbits = 0;
+    static int last_which = -1;
+    static uint last_bn = 0;
+    static KeyboardState last_ks = K_START;
+
+    if(buttons_state == last_state &&
+       last_nbits == count() &&
+       last_which == which() &&
+       last_bn == buttons_now &&
+       last_ks == keyboard_state){
+        Serial.write('\r');
+    }else{
+        Serial.write("\r\n");
+    }
+    last_state = buttons_state;
+    last_nbits = count();
+    last_which = which();
+    last_bn    = buttons_now;
+    last_ks    = keyboard_state;
+
+
+    // Use the button states
+    int nbits = count();
+    int bnm = buttons_now & mask;
+    switch(buttons_state){
+        case START:
+            Serial.print("START   ");
+            Keyboard.releaseAll();
+
+            if(nbits == 1){
+                // Only one button has been pressed, none were pressed before, we can just move to the next state
+                buttons_state = SINGLE_1;
+            }else if(nbits > 2){
+                buttons_state = CHORDING;
+            } // Otherwise just stay in the START state
+            break;
+        case SINGLE_1:
+            Serial.print("SINGLE_1");
+            if(nbits == 1){
+                // Count 1 *might* mean a different pin; hard to physically do but not impossible.
+                uint8_t pressed_history = button_states[which()];
+                if((pressed_history & 0b11) == 0b11){ // It was this button last time too
+                    buttons_state = SINGLE_2;
+                }else{
+                    emit_1(which());
+                }
+            }else if(nbits > 1){
+                buttons_state = CHORDING;
+            }else{
+                // We released it, meaning time to emit a press
+                emit_1(which());
+                buttons_state = START;
             }
-        }
-        reset_run();
+            break;
+        case SINGLE_2:
+            Serial.print("SINGLE_2");
+            if(nbits == 1){
+                uint8_t pressed_history = button_states[which()];
+                if((pressed_history & 0b111) == 0b111){
+                    emit_1(which());
+                    buttons_state = HOLDING;
+                }
+            }else if(nbits > 1){
+                buttons_state = CHORDING;
+            }else{
+                emit_1(which());
+                buttons_state = START;
+            }
+            break;
+        case HOLDING:
+            Serial.print("HOLDING ");
+            if(nbits != 1){
+                buttons_state = START;
+            }
+            break;
+        case CHORDING:
+            Serial.print("CHORDING");
+            if(nbits < 1){
+                buttons_state = START;
+            }else if(bnm == RIGHT_SQUEEZE){
+                Keyboard.press(' ');
+                buttons_state = CHORD_HOLDING;
+            }else if(bnm == LEFT_SQUEEZE){
+                Keyboard.press(KEY_BACKSPACE);
+                buttons_state = CHORD_HOLDING;
+            }else if(bnm == ALL_SQUEEZE){
+                keyboard_state = K_START;
+                buttons_state = CHORD_HOLDING;
+            }
+            break;
+        case CHORD_HOLDING:
+            Serial.print("CHORD_HOLDING");
+            if(nbits == 0){
+                buttons_state = START;
+            }
+            break;
     }
 
-    for(int i = 0; i < N_PINS; i++){
-        DEBUG(pressed_run[i]);
-        DEBUG(' ');
+    Serial.print(" ");
+    switch(keyboard_state){
+        case K_START:
+            Serial.print("K_START");
+            break;
+        case AWAIT_SECOND:
+            Serial.print("AWAIT_SECOND");
+            break;
     }
-    DEBUGLN();
-    for(int i = 0; i < N_PINS; i++){
-        DEBUG(released_run[i]);
-        DEBUG(' ');
-    }
-    DEBUGLN();
-    DEBUGLN("========");
+
+    Serial.print(" ");
+    Serial.print(which());
+    Serial.print(" ");
+    Serial.print(nbits);
+    Serial.print(" ");
+    Serial.print(bnm);
+
+    delay(5);
 }
