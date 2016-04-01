@@ -123,8 +123,11 @@ char lookup(int first, int second){
 
 void clearSerial(){
     while(Serial.available() > 0){
-        if(Serial.read() == 'r'){
-            _reboot_Teensyduino_();
+        char c = Serial.read();
+        switch(c){
+            case 'r':
+                _reboot_Teensyduino_();
+                break;
         }
     }
 }
