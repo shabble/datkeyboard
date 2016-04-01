@@ -12,6 +12,8 @@
 
 Bounce::Bounce()
     : previous_millis(0)
+    , up_millis(0)
+    , down_millis(0)
     , interval_millis(10)
     , state(0)
     , pin(0)
@@ -31,13 +33,26 @@ void Bounce::attach(int pin, int mode){
   this->attach(pin);
 }
 
-unsigned long Bounce::getMillis(){
-    return this->previous_millis;
+unsigned long Bounce::getUpAt(){
+    return this->up_millis;
+}
+
+unsigned long Bounce::getDownAt(){
+    return this->down_millis;
 }
 
 void Bounce::interval(uint16_t interval_millis)
 {
     this->interval_millis = interval_millis;
+}
+
+void Bounce::setTime(bool currentState){
+        previous_millis = millis();
+        if(currentState){
+            up_millis = previous_millis;
+        }else{
+            down_millis = previous_millis;
+        }
 }
 
 bool Bounce::update()
@@ -48,14 +63,14 @@ bool Bounce::update()
 
     // If the reading is different from last reading, reset the debounce counter
     if ( currentState != (bool)(state & _BV(UNSTABLE_STATE)) ) {
-        previous_millis = millis();
+        setTime(currentState);
         state ^= _BV(UNSTABLE_STATE);
     } else
         if ( millis() - previous_millis >= interval_millis ) {
             // We have passed the threshold time, so the input is now stable
             // If it is different from last state, set the STATE_CHANGED flag
             if ((bool)(state & _BV(DEBOUNCED_STATE)) != currentState) {
-                previous_millis = millis();
+                setTime(currentState);
                 state ^= _BV(DEBOUNCED_STATE);
                 state |= _BV(STATE_CHANGED);
             }

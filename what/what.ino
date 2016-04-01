@@ -10,6 +10,8 @@
 #define LEFT_SQUEEZE  0b11110
 #define ALL_SQUEEZE   0b11111
 
+#define HOLD_WAIT_PERIOD 500
+
 #define DEBUG
 
 #ifdef DEBUG
@@ -28,11 +30,10 @@ const int mask = ~((~0) << N_PINS);
 
 // For figuring out when to consider a real button (the actual physical ones) pressed, or when a chord has been pressed
 enum ButtonsState {
+    B_ERROR, // We should really never enter this state
     START,
-    SINGLE_1,
-    SINGLE_2,
+    PRESSING,
     HOLDING,
-    CHORDING,
     CHORD_1,
     CHORD_2,
     CHORD_HOLDING
@@ -52,6 +53,21 @@ const char mapping[N_PINS][N_PINS] = {
     {'u', 'v', 'w', 'x', 'y'},
 };
 
+typedef struct {
+    int what;
+    unsigned long when;
+} TimeButton;
+
+int timeButtonCmp(const void * x, const void * y){
+    TimeButton a = *(const TimeButton *)x, b = *(const TimeButton *)y;
+    if(a.when > b.when){
+        return -1;
+    }else if(b.when > a.when){
+        return 1;
+    }
+    return 0;
+}
+
 // button_states:
 //  Each entry is a byte, we treat each bit in that byte as whether the button was pressed at that moment in time (with
 //  the rightmost bit being the current state)
@@ -70,14 +86,6 @@ ButtonsState buttons_state = START;
 KeyboardState keyboard_state = K_START;
 
 
-// High level idea behind buttons_state state machine:
-// * If pressed for three "moments" and nothing else pressed, consider it held (until released)
-//  - If it's released during the three moments, consider it pressed
-// * If something else is pressed as well during these three moments, start building a chord
-// * If the chord completes, do the chord action
-// * If the chord releases without completing, act as though the buttons were pressed in order according to their
-//   millisecond press times (which I'll need to fork the bounce library to allow us to access).
-
 int count(){
     // How many buttons are currently pressed
     return __builtin_popcount(buttons_now & mask);
@@ -89,7 +97,7 @@ int which(){
     return __builtin_ffs(buttons_now & mask) - 1;
 }
 
-void emit_1(int pin){
+void emit_1(int pin, bool release){
     if(pin < 0 || pin >= N_PINS){
         return;
     }
@@ -99,13 +107,17 @@ void emit_1(int pin){
     static int first;
     switch(keyboard_state){
         case K_START:
-            first = which();
+            first = pin;
             keyboard_state = AWAIT_SECOND;
             break;
 
         case AWAIT_SECOND:
             keyboard_state = K_START;
-            Keyboard.press(lookup(first, which()));
+            char pressing = lookup(first, pin);
+            Keyboard.press(pressing);
+            if(release){
+                Keyboard.release(pressing);
+            }
             break;
     }
 }
@@ -133,18 +145,19 @@ void clearSerial(){
 }
 
 void setup(){
-    #ifdef DEBUG
+#ifdef DEBUG
     Serial.begin(9600);
     while(!Serial){
         ;
     }
-    #endif
+    delay(500);
+#endif
 
     for(int i = 0; i < N_PINS; i++){
         // Initialize the debouncers
         buttons[i] = Bounce();
         buttons[i].attach(i, INPUT_PULLUP);
-        buttons[i].interval(1);
+        buttons[i].interval(20);
 
         // Set all the button states up
         button_states[i] = 0;
@@ -158,10 +171,138 @@ void setup(){
 
     Keyboard.begin();
 
-    PRINTF("|%20s|%20s| %6s | %6s | %6s | ", "Buttons State", "Keyboard State", "pin", "nbits", "bnm");
+    PRINTF("|%20s|%20s| %6s | %6s | %6s | \n", "Buttons State", "Keyboard State", "pin", "nbits", "bnm");
+}
+
+ButtonsState transduce(ButtonsState previous){
+    int nbits, bnm;
+    static int trying_chord, last_bnm = 0;
+    ButtonsState next_state = B_ERROR;  // The function *needs* to set this, we want to throw errors otherwise
+
+    nbits = count();
+    bnm = buttons_now & mask;
+
+    switch(buttons_state){
+        case START:
+            if(nbits == 0){
+                next_state = START;
+            }else if(nbits > 0){
+                next_state = PRESSING;
+            }
+            break;
+        case PRESSING:
+            // This state when 3 > buttons pressed
+            // if nbits goes down, press all released buttons in order of first pressed
+            // if we're left with only one, start counting for it to start being held
+            if(last_bnm == bnm){ // No change
+                if(nbits == 1 &&
+                        (millis() - buttons[which()].getDownAt()) > HOLD_WAIT_PERIOD){
+                    // One button has been pressed for long enough
+                    next_state = HOLDING;
+                    emit_1(which(), false);
+                }else{
+                    next_state = PRESSING;
+                }
+
+            }else{  // Now we need to figure out what kind of change
+                TimeButton released[N_PINS];
+                int where = 0;
+
+                for(int i = 0; i < N_PINS; i++){  // Find the released ones so we can deal with them
+                    if((button_states[i] & 0b11) == 0b10){
+                        released[where++] = {i, buttons[i].getDownAt()};
+                    }
+                }
+
+                switch(where){ // It also acts as a count of how many were released
+                    case 0:
+                        trying_chord = bnm;
+                        switch(bnm){
+                            case RIGHT_SQUEEZE:
+                            case LEFT_SQUEEZE:
+                            case ALL_SQUEEZE:
+                                next_state = CHORD_1;
+                                break;
+                            default:
+                                next_state = PRESSING;
+                                break;
+                        }
+                        break;
+                    case 1:
+                        emit_1(released[0].what, true);
+                        next_state = PRESSING;
+                        break;
+                    default: // 2 or more released
+                        PRINT("Many released ");
+                        if(nbits == 0){
+                            next_state = START;
+                        }else{
+                            next_state = PRESSING;
+                        }
+                        qsort(released, where, sizeof(TimeButton), timeButtonCmp);
+                        for(int i = 0; i < where; i++){
+                            emit_1(released[i].what, true);
+                        }
+                        break;
+                }
+            }
+            break;
+        case HOLDING:
+            // This state when one button pressed and held (e.g. repeating letter)
+            if(nbits == 0){
+            Keyboard.releaseAll();
+                next_state = START;
+            }else{
+                next_state = HOLDING;
+            }
+            break;
+        case CHORD_1:
+            if(bnm == trying_chord){
+                next_state = CHORD_2;
+            }else{
+                next_state = PRESSING;
+            }
+            break;
+        case CHORD_2:
+            if(bnm == trying_chord){
+                next_state = CHORD_HOLDING;
+                switch(bnm){
+                    case RIGHT_SQUEEZE:
+                        PRINTF("Chord Spacebar ");
+                        Keyboard.press(' ');
+                        break;
+                    case LEFT_SQUEEZE:
+                        PRINTF("Chord Backspace ");
+                        Keyboard.press(KEY_BACKSPACE);
+                        break;
+                    case ALL_SQUEEZE:
+                        PRINTF("Chord Cancel ");
+                        keyboard_state = K_START;
+                        break;
+                }
+            }else{
+                next_state = PRESSING;
+            }
+            break;
+        case CHORD_HOLDING:
+            if(nbits == 0){
+                next_state = START;
+                Keyboard.releaseAll();
+            }else{
+                next_state = CHORD_HOLDING;
+            }
+            break;
+
+        case B_ERROR:
+            // Just leave the next state as B_ERROR
+            break;
+    }
+    last_bnm = bnm;
+    return next_state;
 }
 
 void loop(){
+    // Housekeeping
     clearSerial();
     digitalWrite(LED_PIN, keyboard_state == AWAIT_SECOND);
 
@@ -178,27 +319,33 @@ void loop(){
 
     }
 
-    int nbits = count();
-    int bnm = buttons_now & mask;
+    // Use the button states
+    run_debug_print();
+    buttons_state = transduce(buttons_state);
 
-    #ifdef DEBUG
-    // Debug stuff
+    // 200Hz because it seems to work fine
+    delay(5);
+}
+
+void run_debug_print(){
+#ifdef DEBUG
+    int nbits = count(), bnm = buttons_now & mask;
+
+    // So we can tell if we've changed state
+    static ButtonsState last_bs = START;
+    bool state_changed = last_bs == buttons_state;
+    last_bs = buttons_state;
+
     char bs_buf[20];
     switch(buttons_state){
         case START:
             strcpy(bs_buf, "START");
             break;
-        case SINGLE_1:
-            strcpy(bs_buf, "SINGLE_1");
-            break;
-        case SINGLE_2:
-            strcpy(bs_buf, "SINGLE_2");
+        case PRESSING:
+            strcpy(bs_buf, "PRESSING");
             break;
         case HOLDING:
             strcpy(bs_buf, "HOLDING");
-            break;
-        case CHORDING:
-            strcpy(bs_buf, "CHORDING");
             break;
         case CHORD_1:
             strcpy(bs_buf, "CHORD_1");
@@ -208,6 +355,9 @@ void loop(){
             break;
         case CHORD_HOLDING:
             strcpy(bs_buf, "CHORD_HOLDING");
+            break;
+        case B_ERROR:
+            strcpy(bs_buf, "B_ERROR");
             break;
     }
 
@@ -234,112 +384,15 @@ void loop(){
     PRINTF("|%20s|%20s| % 6d | %6u | %6u | ", bs_buf, ks_buf, which(), nbits, bnm);
     strncpy(current_buffer, buffer, BUF_SIZE);
 
-    // </debug stuff>
-    #endif
-
-    static ButtonsState last_bs = START;
-    bool state_changed = last_bs == buttons_state;
-    last_bs = buttons_state;
-    // Use the button states
-    static int trying_chord;
     switch(buttons_state){
         case START:
             if(state_changed){
                 PRINTF("Clean slate");
             }
-            Keyboard.releaseAll();
-
-            if(nbits == 1){
-                // Only one button has been pressed, none were pressed before, we can just move to the next state
-                buttons_state = SINGLE_1;
-            }else if(nbits > 2){
-                buttons_state = CHORDING;
-            } // Otherwise just stay in the START state
             break;
-        case SINGLE_1:
-            if(nbits == 1){
-                // Count 1 *might* mean a different pin; hard to physically do but not impossible.
-                uint8_t pressed_history = button_states[which()];
-                if((pressed_history & 0b11) == 0b11){ // It was this button last time too
-                    buttons_state = SINGLE_2;
-                }else{
-                    emit_1(which());
-                }
-            }else if(nbits > 1){
-                buttons_state = CHORDING;
-            }else{
-                // We released it, meaning time to emit a press
-                emit_1(which());
-                buttons_state = START;
-            }
-            break;
-        case SINGLE_2:
-            if(nbits == 1){
-                uint8_t pressed_history = button_states[which()];
-                if((pressed_history & 0b11111) == 0b11111){
-                    emit_1(which());
-                    buttons_state = HOLDING;
-                }
-            }else if(nbits > 1){
-                buttons_state = CHORDING;
-            }else{
-                emit_1(which());
-                buttons_state = START;
-            }
-            break;
-        case HOLDING:
-            if(nbits < 1){
-                buttons_state = START;
-            }
-            break;
-        case CHORDING:
-            if(nbits < 1){
-                buttons_state = START;
-            }else if(bnm == RIGHT_SQUEEZE){
-                buttons_state = CHORD_1;
-                trying_chord = RIGHT_SQUEEZE;
-            }else if(bnm == LEFT_SQUEEZE){
-                buttons_state = CHORD_1;
-                trying_chord = LEFT_SQUEEZE;
-            }else if(bnm == ALL_SQUEEZE){
-                buttons_state = CHORD_1;
-                trying_chord = ALL_SQUEEZE;
-            }
-            break;
-        case CHORD_1:
-            if(bnm == trying_chord){
-                buttons_state = CHORD_2;
-            }else{
-                buttons_state = CHORDING;
-            }
-            break;
-        case CHORD_2:
-            if(bnm == trying_chord){
-                buttons_state = CHORD_HOLDING;
-                switch(bnm){
-                    case RIGHT_SQUEEZE:
-                        PRINTF("Chord Spacebar ");
-                        Keyboard.press(' ');
-                        break;
-                    case LEFT_SQUEEZE:
-                        PRINTF("Chord Backspace ");
-                        Keyboard.press(KEY_BACKSPACE);
-                        break;
-                    case ALL_SQUEEZE:
-                        PRINTF("Chord Cancel ");
-                        keyboard_state = K_START;
-                        break;
-                }
-            }else{
-                buttons_state = CHORDING;
-            }
-            break;
-        case CHORD_HOLDING:
-            if(nbits == 0){
-                buttons_state = START;
-            }
+        default:
             break;
     }
-    // 200Hz because it seems to work fine
-    delay(10);
+
+#endif
 }

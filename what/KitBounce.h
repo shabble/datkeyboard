@@ -62,8 +62,10 @@ class Bounce
     // Returns the rising pin state
     bool rose();
 
-    // Get the time at which it most recently started pressing
-    unsigned long getMillis();
+    // Get the time at which it most recently started pressing or releasing
+    unsigned long getUpAt();
+    unsigned long getDownAt();
+
 
     // Partial compatibility for programs written with Bounce version 1
     bool risingEdge() { return rose(); }
@@ -74,10 +76,12 @@ class Bounce
     }
 
  protected:
-    unsigned long previous_millis;
+    unsigned long previous_millis, up_millis, down_millis;
     uint16_t interval_millis;
     uint8_t state;
     uint8_t pin;
+ private:
+    void setTime(bool currentState);
 };
 
 #endif
