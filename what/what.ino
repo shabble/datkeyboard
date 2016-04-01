@@ -250,7 +250,7 @@ ButtonsState transduce(ButtonsState previous){
         case HOLDING:
             // This state when one button pressed and held (e.g. repeating letter)
             if(nbits == 0){
-            Keyboard.releaseAll();
+                Keyboard.releaseAll();
                 next_state = START;
             }else{
                 next_state = HOLDING;
