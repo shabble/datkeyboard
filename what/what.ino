@@ -274,6 +274,7 @@ ButtonsState transduce(ButtonsState previous){
                     case LEFT_SQUEEZE:
                         PRINTF("Chord Backspace ");
                         Keyboard.press(KEY_BACKSPACE);
+                        keyboard_state = K_START;
                         break;
                     case ALL_SQUEEZE:
                         PRINTF("Chord Cancel ");
