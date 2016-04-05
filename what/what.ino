@@ -2,17 +2,15 @@
 #include <stdio.h>
 
 // N_PINS must be at most half the bit-width of an int (so can't be >16 right now, AFAIK)
-#define N_PINS 5
+#define N_PINS 10
 
 #define LED_PIN 13
-
-#define RIGHT_SQUEEZE 0b01111
-#define LEFT_SQUEEZE  0b11110
-#define ALL_SQUEEZE   0b11111
+                      //lllllrrrrr
+#define RIGHT_SQUEEZE 0b0000011110
+#define LEFT_SQUEEZE  0b1111000000
+#define ALL_SQUEEZE   0b0111101111
 
 #define HOLD_WAIT_PERIOD 500
-
-#define DEBUG
 
 #ifdef DEBUG
 #define BUF_SIZE 128
@@ -45,12 +43,58 @@ enum KeyboardState {
     AWAIT_SECOND
 };
 
-const char mapping[N_PINS][N_PINS] = {
-    {'a', 'b', 'c', 'd', 'e'},
-    {'f', 'g', 'h', 'i', 'j'},
-    {'k', 'l', 'm', 'n', 'o'},
-    {'p', 'q', 'r', 's', 't'},
-    {'u', 'v', 'w', 'x', 'y'},
+
+// Here come the three letter variable names (so's I can use them in the array down below without messing with the
+// alignment)
+#define CTL KEY_LEFT_CTRL
+#define SFT KEY_LEFT_SHIFT
+#define ALT KEY_LEFT_ALT
+#define WIN KEY_LEFT_GUI
+#define  UP KEY_UP_ARROW
+#define DWN KEY_DOWN_ARROW
+#define LFT KEY_LEFT_ARROW
+#define RIT KEY_RIGHT_ARROW
+#define TAB KEY_TAB
+#define RET KEY_RETURN
+#define ESC KEY_ESC
+#define INS KEY_INSERT
+#define DEL KEY_DELETE
+#define PGU KEY_PAGE_UP
+#define PGD KEY_PAGE_DOWN
+#define HOM KEY_HOME
+#define END KEY_END
+#define CPS KEY_CAPS_LOCK
+
+#define  F1 KEY_F1
+#define  F2 KEY_F2
+#define  F3 KEY_F3
+#define  F4 KEY_F4
+#define  F5 KEY_F5
+#define  F6 KEY_F6
+#define  F7 KEY_F7
+#define  F8 KEY_F8
+#define  F9 KEY_F9
+#define F10 KEY_F10
+#define F11 KEY_F11
+#define F12 KEY_F12
+#define APS '\''
+
+// English letter frequency order:
+// ETAOINSHRDULCMFY WGPVBKXQJZ
+
+const int mapping[N_PINS][N_PINS] = {
+   // r1   r2   r3   r4   r5     l1   l2   l3   l4   l5
+    {HOM, ' ', TAB, ' ', ' ',   '0', ' ', ' ', 'z', ' '}, // r1
+    {LFT, ' ', RET, ' ', PGU,   '1', 'g', 'p', 'j', ' '}, // r2
+    {DWN, DEL, ESC, ' ', PGD,   '2', 'v', 'w', 'q', ' '}, // r3
+    { UP, ' ', ' ', END, ' ',   '3', 'b', 'k', 'x', F11}, // r4
+    {RIT, ' ', ' ', INS, CPS,   '4', ' ', ' ', ' ', F12}, // r5
+
+    {'d', 'c', 'm', 'f', ' ',   '5', CTL, ' ',  F1,  F6}, // l1
+    {'l', 't', 'i', 'r', '`',   '6', ' ', SFT,  F2,  F7}, // l2
+    {'u', 'a', 'e', 'h', '=',   '7', ']', ALT,  F3,  F8}, // l3
+    {'y', 's', 'n', 'o', '-',   '8', '[', ' ',  F4,  F9}, // l4
+    {',', '.', '/', APS, ';',   '9', ' ', ' ',  F5, F10}, // l5
 };
 
 typedef struct {
@@ -113,16 +157,30 @@ void emit_1(int pin, bool release){
 
         case AWAIT_SECOND:
             keyboard_state = K_START;
-            char pressing = lookup(first, pin);
+            int pressing = lookup(first, pin);
             Keyboard.press(pressing);
-            if(release){
-                Keyboard.release(pressing);
+            if(release && immediate_release(pressing)){
+                Keyboard.releaseAll();
             }
             break;
     }
 }
 
-char lookup(int first, int second){
+int immediate_release(int c){
+    switch(c){
+        case CTL:
+        case SFT:
+        case ALT:
+        case WIN:
+            return false;
+            break;
+        default:
+            return true;
+            break;
+    }
+}
+
+int lookup(int first, int second){
     // Get the virtual key to be pressed (the thing to send to the computer) from a pair of real button presses
     if(first >= N_PINS || first < 0){
         PRINTF("\r\nFirst pressed is wrong: %d\n", first);
@@ -130,7 +188,8 @@ char lookup(int first, int second){
     if(second >= N_PINS || second < 0){
         PRINTF("\r\nSecond pressed is wrong: %d\n", second);
     }
-    return mapping[first][second];
+    return mapping[second][first];
+    // Second comes first because we want the `mapping` matrix to be across-then-down (which is intuitive)
 }
 
 void clearSerial(){
